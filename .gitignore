@@ -1,0 +1,9 @@
+# 样本数据绝不上传 GitHub（用户决策：规则可分享，数据只留本地）
+data/
+*.csv
+*.xlsx
+*.xls
+
+# Python 缓存
+__pycache__/
+*.pyc
