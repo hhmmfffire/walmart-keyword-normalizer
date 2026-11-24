@@ -137,12 +137,18 @@ def learn(files):
         for tag, i1, i2, j1, j2 in sm.get_opcodes():
             if tag == "insert":
                 # 被插入的标准词（如 tool / the），以及它前面的触发词（如 otc）
-                for k in range(j1, j2):
-                    insert_words.add(nt[k])
+                inserted = [nt[k] for k in range(j1, j2)]
+                for w in inserted:
+                    insert_words.add(w)            # 被插入的词本身（tool / the）
+                # 触发词：仅取紧邻的前一个词。
+                # 注意：绝不能取后一个词——"otc tool blood pressure" 中 blood 是后词，
+                # 若记为触发词会污染整个血压计类目（blood 是核心词）。
                 if j1 > 0:
-                    insert_words.add(nt[j1 - 1])   # 前触发词，如 otc -> otc tool 中的 otc
-                if j2 < len(nt):
-                    insert_words.add(nt[j2])       # 后触发词，如 the sharper 中的 sharper
+                    insert_words.add(nt[j1 - 1])
+                # 极少数"句首插入定冠词 the"（the sharper image），
+                # 仅当插入词是 the 且位于句首时，才记后一个词为触发词
+                if j1 == 0 and "the" in inserted and j2 < len(nt):
+                    insert_words.add(nt[j2])
             if tag == "equal":
                 # 样本中"保持不变"的复数词（以 s 结尾）
                 for k in range(i1, i2):
