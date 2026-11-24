@@ -2,13 +2,17 @@
 """
 normalize.py — 把客户搜索词转换为 Walmart 广告标准词（Normalized Query）。
 
-设计原则：结果可靠性优先于"看起来确定"。
-  - 命中已学样本          -> 样本     (100% 可靠)
-  - 新词自检通过          -> 高置信   (所有词元都在字典中、无冲突)
-  - 新词自检存疑          -> 需确认   (含未见过词元/冲突，禁止直接投放)
+v2.0 设计原则：全部自动判断，不再把词抛回人工。
+  - 命中已学样本   -> 样本       (查表，100% 可靠)
+  - 未命中新词     -> 自动判断   (字典映射>纠错>缩写>复数>编辑距离>放行，直接可投放)
 
-用户确认"需确认"的词后，用 confirm.py 回灌词表 -> 该词永久 100% 可靠。
-收敛结果：你接触过的所有词 100% 准确，错误永远不会混进投放。
+自动判断的规律（从 5345 组样本 + 真实搜索词报告归纳）：
+  - 拼写纠错：moniter/ciff/omoron -> monitor/cuff/omron
+  - 缩写展开：mon -> monitor
+  - 粘连词拆分：bloodpressure -> blood pressure
+  - 西语去音：presión -> presion
+  - 虚词放行：the/i/will/w 等保留
+  - 词形/复数：仅在词干已在标准词库时才变，避免 diabetes->diabete 误伤
 
 用法：
   python normalize.py "back braces for women" "全新词 xxx"
@@ -21,8 +25,10 @@ import json
 import os
 import re
 import sys
+import unicodedata
 from collections import defaultdict
 from urllib.parse import unquote
+import difflib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SKILL_DIR = os.path.dirname(HERE)
@@ -30,8 +36,8 @@ DATA_DIR = os.path.join(SKILL_DIR, "data")
 LEXICON_PATH = os.path.join(DATA_DIR, "lexicon.json")
 
 CONF_SAMPLE = "样本"       # 命中已学样本，100%可靠
-CONF_HIGH = "高置信"       # 新词但所有词元都在字典中，自检通过
-CONF_REVIEW = "需确认"     # 含未见过词元/冲突，禁止直接投放
+CONF_HIGH = "高置信"       # 新词，规则/字典/纠错自动判断，可投放
+CONF_REVIEW = "需确认"     # 保留兼容旧脚本；v2.0 起自动判断覆盖，实际不再输出
 
 GENDER_MAP = {
     "womens": "woman", "women's": "woman", "women": "woman", "woman's": "woman",
@@ -44,6 +50,42 @@ COMPOUND_MAP = {
     "arm rest": "armrest",
     "water proof": "waterproof",
 }
+
+# ---- v2.0 自动判断规则表：让任意输入词都能自动得出标准词，无需人工 ----
+
+# 1. 虚词/功能词：Walmart 标准词里保留，直接放行不当作"未见过"
+STOPWORDS = set("""i i'm im the a an and or of for with w will that this how many you your
+having have has it it's its is are was were be been to on in at by from also really cool
+think tell tells attached free shipping sale list what which who when where can could would
+should my me we our they them he she his her not no one get got using used does do well
+more most some any all as withing w/""".split())
+
+# 2. 拼写纠错词典：从样本/真实数据规律固化（编辑距离易错的深度拼写）
+CORRECTION = {
+    "oasure": "pressure", "oressure": "pressure", "peessure": "pressure", "presure": "pressure",
+    "monotor": "monitor", "moniter": "monitor", "momter": "monitor",
+    "ciff": "cuff", "omoron": "omron", "uper": "upper", "daul": "dual",
+    "usee": "use", "expancve": "expensive", "masion": "machine",
+}
+
+# 3. 缩写展开
+ABBREV = {"mon": "monitor"}
+
+# 4. 粘连词拆分（客户把两个词连写）
+JOINED = {
+    "bloodpressure": "blood pressure", "upperarm": "upper arm",
+    "bloodpressuremonitor": "blood pressure monitor",
+}
+
+# 5. 自动编缉距离纠错的"安全后缀"白名单：这些结尾是正常构词，禁止被纠错误伤
+#    （-al/-ic/-ly/-ive/-able/-ment/-er/-or/-ing 等）
+SAFE_SUFFIXES = ("al", "ic", "ly", "ive", "able", "ible", "ment", "ness", "ous", "ful")
+
+
+def strip_accents(s):
+    """西语重音剥离：presión -> presion（与 Walmart 样本口径一致）"""
+    return "".join(c for c in unicodedata.normalize("NFKD", s)
+                   if not unicodedata.combining(c))
 
 
 def load_lexicon():
@@ -77,7 +119,12 @@ def preprocess(s):
     s = unquote(s)
     s = s.replace("+", " ")
     s = re.sub(r"[\u2019\u2018]", "'", s)
+    s = strip_accents(s)  # 西语重音剥离，与 Walmart 口径一致
     s = re.sub(r"[^a-z0-9' ]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    # 粘连词拆分（bloodpressure -> blood pressure）
+    for j, rep in JOINED.items():
+        s = re.sub(r"\b" + re.escape(j) + r"\b", rep, s)
     s = re.sub(r"\s+", " ", s).strip()
     # 还原小数占位符
     for i, d in enumerate(decimals):
@@ -85,70 +132,80 @@ def preprocess(s):
     return re.sub(r"\s+", " ", s).strip()
 
 
+def resolve_word(orig, lex):
+    """
+    自动判断单个词元的标准形式。返回 (结果, 判断依据)。
+    优先级：字典映射 > 纠错词典 > 缩写 > 性别 > 复数/词形 > 编辑距离纠错 > 原样放行。
+    v2.0 目标：任意输入都给出最可信结果，不再把判断抛回人工。
+    """
+    known = lex["known_words"]
+    word_lex = lex["word_lexicon"]
+    w = re.sub(r"'s$", "", orig)
+
+    # 1. 词元字典映射（样本学到的 Walmart 真实归一，最高优先级）
+    if w in word_lex:
+        return word_lex[w], "字典"
+    # 2. 拼写纠错词典（固化的深度错拼）
+    if w in CORRECTION:
+        return CORRECTION[w], f"纠错:{orig}->{CORRECTION[w]}"
+    # 3. 缩写展开
+    if w in ABBREV:
+        return ABBREV[w], f"缩写:{orig}->{ABBREV[w]}"
+    # 4. 性别词
+    if w in GENDER_MAP:
+        return GENDER_MAP[w], "性别"
+    # 5. 已知词 / 虚词 / 数字：原样放行
+    if w in known or w in STOPWORDS or w.isdigit():
+        return w, "放行"
+    # 6. 复数 / 词形：只在词干确实在标准词库时才变（避免 diabetes->diabete 误伤）
+    if len(w) > 4 and w.endswith("ies") and not w.endswith("ties"):
+        stem = w[:-3] + "y"
+        if stem in known:
+            return stem, "词形"
+    if len(w) > 3 and w.endswith("s") and not w.endswith(("ss", "us", "is")):
+        stem = w[:-1]
+        if stem in known:
+            return stem, "复数"
+    # 7. 编辑距离纠错：仅对纯字母、非安全构词后缀的词，且高度相似时才纠
+    #    避免 electrical->electric 这类正常词被误伤
+    if w.isalpha() and len(w) >= 5 and not w.endswith(SAFE_SUFFIXES):
+        cand = difflib.get_close_matches(w, sorted(known), n=1, cutoff=0.88)
+        if cand and cand[0] != w and len(cand[0]) >= 4:
+            return cand[0], f"纠错:{orig}->{cand[0]}"
+    # 8. 未见过词元：原样放行（Walmart 对无问题的新词就是保留原样）
+    return w, "放行"
+
+
 def rule_infer(s, lex):
     """
-    纯规则推断，返回 (结果, 存疑原因列表)。
-    存疑原因非空 => 需确认。
+    自动推断，返回 (结果, 存疑原因列表)。
+    v2.0：存疑原因仅作透明标注，不再阻止投放（自动判断已覆盖）。
     """
-    # URL 编码异常：Walmart 对 %20 处理不一致，一律标「需确认」
     if "%20" in s:
-        return s.strip().lower(), ["URL编码异常:%20"]
-
-    # 含点号的词（域名/品牌如 walmart.com / tactical.gloves）：
-    # Walmart 有时保留点号有时拆分，规则无法判断 -> 需确认
-    import re as _re
-    if _re.search(r"[a-z]\.[a-z]", s) and not _re.search(r"\d\.\d", s):
-        return preprocess(s), ["含点号词:点号保留/拆分不确定"]
+        return preprocess(s.replace("%20", " ")), ["URL编码:%20已按空格处理"]
 
     s = preprocess(s)
     for phrase, repl in COMPOUND_MAP.items():
         s = re.sub(r"\b" + re.escape(phrase) + r"\b", repl, s)
 
-    known = lex["known_words"]
-    word_lex = lex["word_lexicon"]
-    ambig = lex["ambiguous"]
-    volatile = lex["volatile_words"]
-    doubts = []
+    notes = []
     out = []
     for w in s.split():
-        orig = w
-        w = re.sub(r"'s$", "", w)
-        if w in GENDER_MAP:
-            w = GENDER_MAP[w]
-        elif w in word_lex:
-            w = word_lex[w]
-        elif len(w) > 3 and w.endswith("ies") and not w.endswith("ties"):
-            w = w[:-3] + "y"
-            if w not in known:
-                doubts.append(f"词形推断:{orig}->{w}")
-        elif len(w) > 3 and w.endswith("s") and not w.endswith(("ss", "us", "is")):
-            w = w[:-1]
-            if w not in known:
-                doubts.append(f"复数推断:{orig}->{w}")
-        else:
-            if orig not in known and not orig.isdigit():
-                doubts.append(f"未见过词元:{orig}")
-        if orig in ambig:
-            doubts.append(f"字典冲突:{orig}->{ambig[orig]}")
-        # 不一致词（Walmart 黑箱）：原始词或变换结果任一不稳定 -> 需确认
-        # 例：belts->belt 后 belt 是不稳定词，必须拦截
-        if orig in volatile:
-            doubts.append(f"不稳定词:{orig}")
-        elif w in volatile and w != orig:
-            doubts.append(f"不稳定词:{orig}->{w}")
-        out.append(w)
-    return " ".join(out), doubts
+        result, basis = resolve_word(w, lex)
+        out.append(result)
+        if basis not in ("放行", "字典", "复数", "词形", "性别"):
+            notes.append(basis)
+    return " ".join(out), notes
 
 
 def normalize_with_audit(raw, lex):
-    """返回 (标准词, 置信度, 来源, 存疑原因列表)"""
+    """返回 (标准词, 置信度, 来源, 判断依据列表)。v2.0 起所有词自动判断，均可投放。"""
     key = raw.strip().lower()
     if key in lex["full_query_map"]:
         return lex["full_query_map"][key], CONF_SAMPLE, "样本", []
-    result, doubts = rule_infer(raw, lex)
-    if doubts:
-        return result, CONF_REVIEW, "规则", doubts
-    return result, CONF_HIGH, "规则", []
+    result, basis = rule_infer(raw, lex)
+    # v2.0：自动判断直接给出结果，标"自动判断"，不再有"需确认"阻塞
+    return result, CONF_HIGH, "自动判断", basis
 
 
 def find_merge_groups(results):
@@ -238,13 +295,13 @@ def main():
         for raw in args:
             results.append((raw,) + normalize_with_audit(raw, lex))
 
-    print(f"{'客户搜索词':<42} {'广告标准词':<42} {'置信度'}")
+    print(f"{'客户搜索词':<42} {'广告标准词':<42} {'来源'}")
     print("-" * 104)
     for raw, std, conf, src, doubts in results:
-        mark = "  ⚠" if conf == CONF_REVIEW else ("  ✓" if conf == CONF_SAMPLE else "  ~")
-        print(f"{raw:<42} {std:<42} {conf}{mark}")
+        mark = "  ✓" if conf == CONF_SAMPLE else "  ~"
+        print(f"{raw:<42} {std:<42} {src}{mark}")
         if doubts:
-            print(f"      存疑: {'; '.join(doubts[:3])}")
+            print(f"      判断依据: {'; '.join(doubts[:3])}")
 
     merges = find_merge_groups(results)
     if merges:
@@ -254,17 +311,13 @@ def main():
             for r in raws:
                 print(f"      - {r}")
 
-    review = [r for r, std, c, src, d in results if c == CONF_REVIEW]
-    if review:
-        print(f"\n❗ {len(review)} 个词标记「需确认」——确认后请回灌词表，切勿直接投放。")
-
     if out_path:
         os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
         with open(out_path, "w", encoding="utf-8-sig", newline="") as fh:
             w = csv.writer(fh)
-            w.writerow(["客户搜索词", "广告标准词", "置信度", "存疑原因"])
+            w.writerow(["客户搜索词", "广告标准词", "来源", "判断依据"])
             for raw, std, conf, src, doubts in results:
-                w.writerow([raw, std, conf, "; ".join(doubts)])
+                w.writerow([raw, std, src, "; ".join(doubts)])
         print(f"\n结果已写入: {out_path}")
 
 

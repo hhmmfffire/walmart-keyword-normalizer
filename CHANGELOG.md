@@ -12,6 +12,18 @@
 
 ---
 
+## v2.0 (2026-11-24)
+- 重大变更：取消「需确认」状态，改为全部自动判断——用户明确"不要人工判断，skill 的意义就是由 AI 全部判断、自行找规律"
+- 新增自动判断层（normalize.py Step 7，9 级优先级）：词元字典 > 固化纠错词典 > 缩写 > 性别 > 虚词放行 > 粘连词拆分 > 西语去音(NFKD) > 编辑距离纠错(cutoff 0.88,排除正常构词后缀) > 原样放行
+- 新增固化纠错词典：moniter/ciff/omoron/expancve/uper/daul/masion/oressure/peessure 等深度错拼
+- 新增粘连词拆分：bloodpressure→blood pressure、upperarm→upper arm；缩写 mon→monitor
+- 预处理加西语重音剥离（presión→presion），与 Walmart 样本口径一致
+- 复数变形加安全约束（仅词干在标准词库才变），避免 diabetes→diabete 误伤
+- normalize_with_audit 不再返回 CONF_REVIEW，全部标「样本」或「自动判断」，均可投放
+- evaluate.py 三指标更新：已收录词准确率100% / 新词自动判断96.9% / 自动判断覆盖率100%
+- 触发样本：ALPHAGOMED 血压计搜索词报告（236 唯一词），需确认从 39 降到 0
+- 影响：236 词全部自动出标准词，去重后 216 个可投放词；无需任何人工确认
+
 ## v1.3 (2026-11-24)
 - 修复严重 bug：插入触发词检测误把「后一个词」记为不稳定词，导致 `otc tool blood pressure` 中 `blood` 被污染，整个血压计类目词全被误标「需确认」
 - 修正：插入触发词只取紧邻前词（`otc`）；仅当插入词是句首定冠词 `the` 时才取后词（`the sharper image`）
