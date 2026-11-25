@@ -12,6 +12,12 @@
 
 ---
 
+## v2.1 (2026-11-25)
+- 修复编辑距离误伤：voice→vice（正常词 voice 被错纠成 known 里的 vice）。新增 SAFE_WORDS 白名单，编辑距离纠错跳过 voice/cup/meter/kit/watch 等正常词
+- 扩充固化纠错词典：0mron→omron（数字0代o）、nlood→blood（n代b）、pressurr→pressure、mchine→machine、precion→presion、alteria→arterial
+- 触发样本：ALPHAGOMED 视频广告关键词表现报告（2026-11-25，110行视频广告词）
+- 影响：0mron/nlood 等错拼纠正后命中已收录词库，避免重复开词
+
 ## v2.0 (2026-11-24)
 - 重大变更：取消「需确认」状态，改为全部自动判断——用户明确"不要人工判断，skill 的意义就是由 AI 全部判断、自行找规律"
 - 新增自动判断层（normalize.py Step 7，9 级优先级）：词元字典 > 固化纠错词典 > 缩写 > 性别 > 虚词放行 > 粘连词拆分 > 西语去音(NFKD) > 编辑距离纠错(cutoff 0.88,排除正常构词后缀) > 原样放行

@@ -66,7 +66,19 @@ CORRECTION = {
     "monotor": "monitor", "moniter": "monitor", "momter": "monitor",
     "ciff": "cuff", "omoron": "omron", "uper": "upper", "daul": "dual",
     "usee": "use", "expancve": "expensive", "masion": "machine",
+    # v2.1 新增（由 ALPHAGOMED 视频广告词触发）
+    "0mron": "omron",            # 数字0替代字母o
+    "nlood": "blood",            # n替代b
+    "pressurr": "pressure",      # 双r错拼
+    "mchine": "machine",         # 漏a
+    "precion": "presion",        # 西语错拼
+    "alteria": "arterial",       # 西语词尾错拼
 }
+
+# 正常词白名单：编辑距离纠错必须跳过这些，避免 voice->vice 这类误伤
+# （v2.1：voice 被错纠成 vice，加入保护）
+SAFE_WORDS = set("""voice vice cup meter checker kit watch charger power electric pediatric
+plug table top wrap cuffless talking platinum heart""".split())
 
 # 3. 缩写展开
 ABBREV = {"mon": "monitor"}
@@ -166,9 +178,9 @@ def resolve_word(orig, lex):
         stem = w[:-1]
         if stem in known:
             return stem, "复数"
-    # 7. 编辑距离纠错：仅对纯字母、非安全构词后缀的词，且高度相似时才纠
-    #    避免 electrical->electric 这类正常词被误伤
-    if w.isalpha() and len(w) >= 5 and not w.endswith(SAFE_SUFFIXES):
+    # 7. 编辑距离纠错：仅对纯字母、非安全构词后缀、非白名单词，且高度相似时才纠
+    #    避免 electrical->electric / voice->vice 这类正常词被误伤
+    if w.isalpha() and len(w) >= 5 and w not in SAFE_WORDS and not w.endswith(SAFE_SUFFIXES):
         cand = difflib.get_close_matches(w, sorted(known), n=1, cutoff=0.88)
         if cand and cand[0] != w and len(cand[0]) >= 4:
             return cand[0], f"纠错:{orig}->{cand[0]}"
